@@ -4040,6 +4040,33 @@ AST *FindMethodInList(AST *list, AST *ident, int *curptr)
     return list;
 }
 
+/* Transform nested designators into nested initializer lists */
+/* For example: .p.x = 10 becomes .p = {.x = 10} */
+static AST *
+TransformNestedDesignator(AST *designator, AST *value, Module *P)
+{
+    if (!designator || designator->kind != AST_METHODREF || !designator->left) {
+        /* Simple designator, no transformation needed */
+        return NewAST(AST_INITMODIFIER, designator, value);
+    }
+    
+    /* This is a nested designator like .p.x */
+    AST *outer_field = designator->right;  /* "p" */
+    AST *inner_designator = designator->left;  /* .x */
+    
+    /* Recursively handle deeper nesting */
+    AST *inner_init = TransformNestedDesignator(inner_designator, value, NULL);
+    
+    /* Create the inner initializer list */
+    AST *inner_list = NewAST(AST_EXPRLIST, inner_init, NULL);
+    
+    /* Create the outer designator */
+    AST *outer_designator = NewAST(AST_METHODREF, NULL, outer_field);
+    
+    /* Return the transformed initializer */
+    return NewAST(AST_INITMODIFIER, outer_designator, inner_list);
+}
+
 /* fix up an initializer list of a given type */
 /* creates an array containing the initializer expressions;
  * each of these may in turn be an array of initializers
@@ -4112,18 +4139,22 @@ FixupInitList(AST *type, AST *initval)
                 AST *root = val->left;
                 AST *fixup = root->left;
                 AST *newval = root->right;
-                if (!fixup || fixup->kind != AST_ARRAYREF) {
-                    ERROR(fixup, "initialization designator for array is not an array element");
-                    val->left = AstInteger(0);
-                } else if (fixup->left != NULL) {
-                    ERROR(fixup, "Internal error, cannot handle nested designators");
-                    val->left = AstInteger(0);
-                } else if (!IsConstExpr(fixup->right)) {
-                    ERROR(fixup, "initialization designator for array is not constant");
-                    val->left = AstInteger(0);
+                
+                /* Only process this as an array designator if it actually has an array reference */
+                if (fixup && fixup->kind == AST_ARRAYREF) {
+                    if (fixup->left != NULL) {
+                        ERROR(fixup, "Internal error, cannot handle nested designators");
+                        val->left = AstInteger(0);
+                    } else if (!IsConstExpr(fixup->right)) {
+                        ERROR(fixup, "initialization designator for array is not constant");
+                        val->left = AstInteger(0);
+                    } else {
+                        curelem = EvalConstExpr(fixup->right);
+                        val->left = newval;
+                    }
                 } else {
-                    curelem = EvalConstExpr(fixup->right);
-                    val->left = newval;
+                    /* This is not an array designator, leave it for struct processing */
+                    /* Don't change curelem, just process the element normally */
                 }
             }
             if (curelem < numelems) {
@@ -4132,6 +4163,8 @@ FixupInitList(AST *type, AST *initval)
                     // an error
                     WARNING(val, "Duplicate definition for element %d of array", curelem);
                 }
+                
+                
                 astarr[curelem] = val;
                 curelem++;
             } else {
@@ -4168,8 +4201,23 @@ FixupInitList(AST *type, AST *initval)
                     ERROR(fixup, "initialization designator for struct is not a method reference");
                     newval = AstInteger(0);
                 } else if (fixup->left != NULL) {
-                    ERROR(fixup, "Internal error, cannot handle nested designators");
-                    newval = AstInteger(0);
+                    /* Handle nested designators like .p.x by transforming them */
+                    AST *transformed = TransformNestedDesignator(fixup, newval, P);
+                    
+                    /* We need to process this transformed initializer in the context of the current struct */
+                    /* For now, we'll recursively process it by reinserting it into the initializer list */
+                    /* This is a simplified approach - a full implementation would need more sophisticated merging */
+                    
+                    /* Find the outer field */
+                    AST *outer_field_name = fixup->right;
+                    varlist = FindMethodInList(P->finalvarblock, outer_field_name, &curelem);
+                    if (!varlist) {
+                        ERROR(fixup, "%s not found in struct", GetUserIdentifierName(outer_field_name));
+                        newval = AstInteger(0);
+                    } else {
+                        /* Use the transformed nested initializer */
+                        newval = transformed->right;
+                    }
                 } else {
                     varlist = FindMethodInList(P->finalvarblock, fixup->right, &curelem);
                     if (!varlist) {
