@@ -1704,22 +1704,48 @@ EvalExpr(AST *expr, unsigned flags, int *valid, int depth)
     kind = expr->kind;
     switch (kind) {
     case AST_EXPRLIST:
-        // some 64 bit expressions come back as low/high pairs
-        if (!expr->left || !expr->right || expr->right->right) {
-            goto invalid_const_expr;
+        // Handle simple single-element expression lists (from designated initializers)
+        if (expr->left && !expr->right) {
+            return EvalExpr(expr->left, flags, valid, depth+1);
         }
-        if (expr->left->kind != AST_GETLOW || expr->right->left->kind != AST_GETHIGH) {
-            goto invalid_const_expr;
+        // Handle multi-element expression lists by checking if all elements are constant
+        // This is needed for nested designated initializers
+        if (expr->left && expr->right) {
+            // Check if this might be a 64-bit low/high pair first
+            if (!expr->right->right && 
+                expr->left->kind == AST_GETLOW && 
+                expr->right->left && expr->right->left->kind == AST_GETHIGH) {
+                lval = EvalExpr(expr->left->left, flags, valid, depth+1);
+                if (valid && !*valid) return intExpr(0);
+                rval = EvalExpr(expr->right->left->left, flags, valid, depth+1);
+                if (valid && !*valid) return intExpr(1);
+                if (!CompatibleTypes(lval.type, rval.type)) goto invalid_const_expr;
+                if (lval.val != rval.val) {
+                    goto invalid_const_expr;
+                }
+                return lval;
+            }
+            
+            // For other multi-element lists, check if all elements are constant
+            // If so, this represents a constant aggregate (struct/array initializer)
+            AST *elem = expr;
+            while (elem) {
+                if (!elem->left) {
+                    goto invalid_const_expr;
+                }
+                // Check if this element is constant
+                int elem_valid = 1;
+                EvalExpr(elem->left, flags, &elem_valid, depth+1);
+                if (!elem_valid) {
+                    goto invalid_const_expr;
+                }
+                elem = elem->right;
+            }
+            // All elements are constant, so this is a constant aggregate
+            // Return the first element's value as a representative
+            return EvalExpr(expr->left, flags, valid, depth+1);
         }
-        lval = EvalExpr(expr->left->left, flags, valid, depth+1);
-        if (valid && !*valid) return intExpr(0);
-        rval = EvalExpr(expr->right->left->left, flags, valid, depth+1);
-        if (valid && !*valid) return intExpr(1);
-        if (!CompatibleTypes(lval.type, rval.type)) goto invalid_const_expr;
-        if (lval.val != rval.val) {
-            goto invalid_const_expr;
-        }
-        return lval;
+        goto invalid_const_expr;
     case AST_HERE_IMM:
     case AST_INTEGER:
     case AST_BITVALUE:
@@ -4040,6 +4066,33 @@ AST *FindMethodInList(AST *list, AST *ident, int *curptr)
     return list;
 }
 
+/* Transform nested designators into nested initializer lists */
+/* For example: .p.x = 10 becomes .p = {.x = 10} */
+static AST *
+TransformNestedDesignator(AST *designator, AST *value, Module *P)
+{
+    if (!designator || designator->kind != AST_METHODREF || !designator->left) {
+        /* Simple designator, no transformation needed */
+        return NewAST(AST_INITMODIFIER, designator, value);
+    }
+    
+    /* This is a nested designator like .p.x */
+    AST *outer_field = designator->right;  /* "p" */
+    AST *inner_designator = designator->left;  /* .x */
+    
+    /* Recursively handle deeper nesting */
+    AST *inner_init = TransformNestedDesignator(inner_designator, value, NULL);
+    
+    /* Create the inner initializer list */
+    AST *inner_list = NewAST(AST_EXPRLIST, inner_init, NULL);
+    
+    /* Create the outer designator */
+    AST *outer_designator = NewAST(AST_METHODREF, NULL, outer_field);
+    
+    /* Return the transformed initializer */
+    return NewAST(AST_INITMODIFIER, outer_designator, inner_list);
+}
+
 /* fix up an initializer list of a given type */
 /* creates an array containing the initializer expressions;
  * each of these may in turn be an array of initializers
@@ -4112,18 +4165,22 @@ FixupInitList(AST *type, AST *initval)
                 AST *root = val->left;
                 AST *fixup = root->left;
                 AST *newval = root->right;
-                if (!fixup || fixup->kind != AST_ARRAYREF) {
-                    ERROR(fixup, "initialization designator for array is not an array element");
-                    val->left = AstInteger(0);
-                } else if (fixup->left != NULL) {
-                    ERROR(fixup, "Internal error, cannot handle nested designators");
-                    val->left = AstInteger(0);
-                } else if (!IsConstExpr(fixup->right)) {
-                    ERROR(fixup, "initialization designator for array is not constant");
-                    val->left = AstInteger(0);
+                
+                /* Only process this as an array designator if it actually has an array reference */
+                if (fixup && fixup->kind == AST_ARRAYREF) {
+                    if (fixup->left != NULL) {
+                        ERROR(fixup, "Internal error, cannot handle nested designators");
+                        val->left = AstInteger(0);
+                    } else if (!IsConstExpr(fixup->right)) {
+                        ERROR(fixup, "initialization designator for array is not constant");
+                        val->left = AstInteger(0);
+                    } else {
+                        curelem = EvalConstExpr(fixup->right);
+                        val->left = newval;
+                    }
                 } else {
-                    curelem = EvalConstExpr(fixup->right);
-                    val->left = newval;
+                    /* This is not an array designator, leave it for struct processing */
+                    /* Don't change curelem, just process the element normally */
                 }
             }
             if (curelem < numelems) {
@@ -4132,6 +4189,13 @@ FixupInitList(AST *type, AST *initval)
                     // an error
                     WARNING(val, "Duplicate definition for element %d of array", curelem);
                 }
+                
+                // If this array element is a struct with designated initializers, process it recursively
+                AST *elem_type = BaseType(type);
+                if (IsClassType(elem_type) && val->left && val->left->kind == AST_EXPRLIST) {
+                    val->left = FixupInitList(elem_type, val->left);
+                }
+                
                 astarr[curelem] = val;
                 curelem++;
             } else {
@@ -4168,8 +4232,23 @@ FixupInitList(AST *type, AST *initval)
                     ERROR(fixup, "initialization designator for struct is not a method reference");
                     newval = AstInteger(0);
                 } else if (fixup->left != NULL) {
-                    ERROR(fixup, "Internal error, cannot handle nested designators");
-                    newval = AstInteger(0);
+                    /* Handle nested designators like .p.x by transforming them */
+                    AST *transformed = TransformNestedDesignator(fixup, newval, P);
+                    
+                    /* We need to process this transformed initializer in the context of the current struct */
+                    /* For now, we'll recursively process it by reinserting it into the initializer list */
+                    /* This is a simplified approach - a full implementation would need more sophisticated merging */
+                    
+                    /* Find the outer field */
+                    AST *outer_field_name = fixup->right;
+                    varlist = FindMethodInList(P->finalvarblock, outer_field_name, &curelem);
+                    if (!varlist) {
+                        ERROR(fixup, "%s not found in struct", GetUserIdentifierName(outer_field_name));
+                        newval = AstInteger(0);
+                    } else {
+                        /* Use the transformed nested initializer */
+                        newval = transformed->right;
+                    }
                 } else {
                     varlist = FindMethodInList(P->finalvarblock, fixup->right, &curelem);
                     if (!varlist) {
@@ -4177,6 +4256,15 @@ FixupInitList(AST *type, AST *initval)
                         break;
                     }
                 }
+                
+                // If newval is a struct initializer with designated initializers, process it recursively
+                if (newval && newval->kind == AST_EXPRLIST && varlist) {
+                    AST *field_type = ExprType(varlist->left);
+                    if (IsClassType(field_type)) {
+                        newval = FixupInitList(field_type, newval);
+                    }
+                }
+                
                 val->left = newval;
             }
             if (is_union) {

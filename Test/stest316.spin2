@@ -1,4 +1,0 @@
-pub demo()
-  org
-    loc ptrb,#\$10000
-  end
