@@ -1,0 +1,197 @@
+name: FlexCC Release
+
+on:
+  push:
+    tags: "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v7.4.5)'
+        required: true
+        type: string
+
+jobs:
+  build-cross-platform:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - cross: linux-musl
+            arch: linux-amd64
+            build_dir: build
+          - cross: win32
+            arch: windows-amd64
+            build_dir: build-win32
+          - cross: rpi
+            arch: raspberry-pi
+            build_dir: build-rpi
+          - cross: macosx
+            arch: macos-amd64
+            build_dir: build-macosx
+    
+    steps:
+      - name: Upgrade packages
+        run: sudo apt-get update
+
+      - name: Install musl tools
+        if: matrix.cross == 'linux-musl'
+        run: sudo apt-get install musl-tools
+
+      - name: Install MinGW
+        if: matrix.cross == 'win32'
+        run: sudo apt-get install gcc-mingw-w64-i686
+
+      - name: Install arm GCC
+        if: matrix.cross == 'rpi'
+        run: sudo apt-get install gcc-arm-linux-gnueabihf
+
+      - name: Setup osxcross for macOS
+        if: matrix.cross == 'macosx'
+        uses: mbround18/setup-osxcross@v1
+        with:
+          osx-version: "12.3"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+            git checkout "$VERSION"
+          else
+            VERSION="${{ github.ref_name }}"
+          fi
+          echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+          echo "tag=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build all executables
+        run: make CROSS=${{ matrix.cross }}
+
+      - name: Create release structure
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PACKAGE_NAME="flexcc-${VERSION}"
+          mkdir -p "${PACKAGE_NAME}/bin/${{ matrix.arch }}"
+          mkdir -p "${PACKAGE_NAME}/include"
+          mkdir -p "${PACKAGE_NAME}/doc"
+          
+          cp ${{ matrix.build_dir }}/flexcc* "${PACKAGE_NAME}/bin/${{ matrix.arch }}/"
+          cp ${{ matrix.build_dir }}/flexspin* "${PACKAGE_NAME}/bin/${{ matrix.arch }}/"
+          cp ${{ matrix.build_dir }}/spin2cpp* "${PACKAGE_NAME}/bin/${{ matrix.arch }}/"
+          
+          # Set execute permissions on all binaries
+          chmod +x "${PACKAGE_NAME}/bin/${{ matrix.arch }}"/*
+          
+          # Copy include directory
+          cp -r include/* "${PACKAGE_NAME}/include/"
+          
+          # Copy documentation
+          cp -r doc/* "${PACKAGE_NAME}/doc/"
+          cp README.md Flexspin.md COPYING Changelog.txt "${PACKAGE_NAME}/"
+
+      - name: Create package.json for PlatformIO
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PACKAGE_NAME="flexcc-${VERSION}"
+          
+          cat > "${PACKAGE_NAME}/package.json" << EOF
+          {
+            "name": "toolchain-flexcc",
+            "version": "${VERSION}",
+            "description": "FlexCC - A C compiler for Propeller microcontrollers",
+            "keywords": [
+              "propeller",
+              "parallax",
+              "compiler",
+              "c",
+              "embedded"
+            ],
+            "homepage": "https://github.com/totalspectrum/spin2cpp",
+            "license": "MIT"
+          }
+          EOF
+
+      - name: Upload platform binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: "flexcc-*/bin/${{ matrix.arch }}/"
+
+      - name: Upload shared files (include and docs)
+        if: matrix.arch == 'linux-amd64'  # Only upload once
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-files
+          path: |
+            flexcc-*/include/
+            flexcc-*/doc/
+            flexcc-*/*.md
+            flexcc-*/COPYING
+            flexcc-*/Changelog.txt
+            flexcc-*/package.json
+
+  create-release:
+    needs: build-cross-platform
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${{ github.ref_name }}"
+          fi
+          echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+          echo "tag=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create combined package structure
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PACKAGE_NAME="flexcc-${VERSION}"
+          
+          # Create main directory structure
+          mkdir -p "${PACKAGE_NAME}/bin"
+          
+          # Copy shared files (from linux-amd64 build) 
+          cp -r shared-files/flexcc-*/* "${PACKAGE_NAME}/"
+          
+          # Copy binaries for each platform
+          for platform in linux-amd64 windows-amd64 raspberry-pi macos-amd64; do
+            if [ -d "binaries-${platform}" ]; then
+              mkdir -p "${PACKAGE_NAME}/bin/${platform}"
+              # Copy executables directly from the nested structure
+              cp binaries-${platform}/flexcc-*/bin/${platform}/* "${PACKAGE_NAME}/bin/${platform}/"
+              # Set execute permissions on all binaries for this platform
+              chmod +x "${PACKAGE_NAME}/bin/${platform}"/*
+            fi
+          done
+
+      - name: Create zip package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PACKAGE_NAME="flexcc-${VERSION}"
+          zip -r "flexcc.zip" "${PACKAGE_NAME}"
+
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          name: "FlexCC Multi-Platform v${{ steps.version.outputs.version }}"
+          tag: ${{ steps.version.outputs.tag }}
+          body: "FlexCC multi-platform release with binaries for Linux, Windows, Raspberry Pi, and macOS."
+          artifacts: "flexcc.zip"
+          artifactErrorsFailBuild: true
+          draft: false
+          prerelease: false
+          allowUpdates: true
+          skipIfReleaseExists: false
