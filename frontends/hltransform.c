@@ -1,6 +1,6 @@
 /*
  * Spin to C/C++ converter
- * Copyright 2011-2025 Total Spectrum Software Inc.
+ * Copyright 2011-2025 Total Spectrum Software Inc. and contributors
  * See the file COPYING for terms of use
  *
  * various high level transformations that should take
@@ -15,44 +15,70 @@
  * fix up references
  */
 static void
-fixReferences(AST **astptr, int incdecop)
+AdjustReference(AST **astptr, AST *ast, AST *typ, int incdecop, AST *memtype, AST *index)
 {
-    AST *ast = *astptr;
-    AST *typ;
     AST *deref;
     ASTReportInfo saveinfo;
 
+    if (incdecop == '@') return;
+    AstReportAs(ast, &saveinfo);
+    if (!index) index = AstInteger(0);
+    if (memtype) {
+        deref = NewAST(AST_CAST,
+                       NewAST(AST_PTRTYPE, memtype, NULL),
+                       ast);
+    } else {
+        deref = ast;
+    }
+    if (incdecop) {
+        switch (incdecop) {
+        case K_REF_POSTDEC:
+            ast = AstOperator(K_DECREMENT, deref, NULL); break;
+        case K_REF_POSTINC:
+            ast = AstOperator(K_INCREMENT, deref, NULL); break;
+        case K_REF_PREDEC:
+            ast = AstOperator(K_DECREMENT, NULL, deref); break;
+        case K_REF_PREINC:
+            ast = AstOperator(K_INCREMENT, NULL, deref); break;
+        default:
+            ERROR(ast, "Internal compiler error: unknown op\n"); break;
+        }
+    }
+    deref = NewAST(AST_MEMREF, typ->left, ast);
+    deref = NewAST(AST_ARRAYREF, deref, index);
+    *astptr = deref;
+    AstReportDone(&saveinfo);
+}
+
+static void
+fixReferences(AST **astptr, int incdecop, AST *memtype)
+{
+    AST *ast = *astptr;
+    AST *typ;
+
     if (!ast) return;
     switch (ast->kind) {
+    case AST_ARRAYREF:
+        if (IsIdentifier(ast->left)) {
+            // fixReferences(&ast->left, '@', memtype); // unnecessary
+            fixReferences(&ast->right, incdecop, memtype);
+            typ = ExprType(ast->left);
+            if (typ && IsRefType(typ)) {
+                AdjustReference(astptr, ast->left, typ, incdecop, memtype, ast->right);
+            }
+            return;
+        }
+        break;
     case AST_IDENTIFIER:
     case AST_LOCAL_IDENTIFIER:
         typ = ExprType(ast);
         if (typ && IsRefType(typ)) {
-            if (incdecop == '@') return;
-            AstReportAs(ast, &saveinfo);
-            if (incdecop) {
-                switch (incdecop) {
-                case K_REF_POSTDEC:
-                    ast = AstOperator(K_DECREMENT, ast, NULL); break;
-                case K_REF_POSTINC:
-                    ast = AstOperator(K_INCREMENT, ast, NULL); break;
-                case K_REF_PREDEC:
-                    ast = AstOperator(K_DECREMENT, NULL, ast); break;
-                case K_REF_PREINC:
-                    ast = AstOperator(K_INCREMENT, NULL, ast); break;
-                default:
-                    ERROR(ast, "Internal compiler error: unknown op\n"); break;
-                }
-            }
-            deref = NewAST(AST_MEMREF, typ->left, ast);
-            deref = NewAST(AST_ARRAYREF, deref, AstInteger(0));
-            *astptr = deref;
-            AstReportDone(&saveinfo);
+            AdjustReference(astptr, ast, typ, incdecop, memtype, NULL);
         }
         return;
     case AST_ASSIGN_INIT:
         /* leave the LHS alone, if it's a reference we are assigning it */
-        fixReferences(&ast->right, incdecop);
+        fixReferences(&ast->right, incdecop, NULL);
         return;
     case AST_OPERATOR:
         if (ast->d.ival == K_REF_PREINC || ast->d.ival == K_REF_PREDEC
@@ -63,8 +89,8 @@ fixReferences(AST **astptr, int incdecop)
             if (!IsRefType(typ)) {
                 ERROR(ast, "Applying [++] or [--] to a non-pointer");
             } else {
-                fixReferences(&ast->left, op);
-                fixReferences(&ast->right, op);
+                fixReferences(&ast->left, op, memtype);
+                fixReferences(&ast->right, op, memtype);
                 *astptr = (ast->left) ? ast->left : ast->right;
                 return;
             }
@@ -74,16 +100,20 @@ fixReferences(AST **astptr, int incdecop)
     case AST_ABSADDROF:
         typ = ExprType(ast->left);
         if (typ && IsRefType(typ)) {
-            fixReferences(&ast->left, '@');
+            fixReferences(&ast->left, '@', NULL);
             *astptr = ast->left;
             return;
         }
         break;
+    case AST_MEMREF:
+        typ = ast->left;
+        fixReferences(&ast->right, incdecop, typ);
+        return;
     default:
         break;
     }
-    fixReferences(&ast->left, incdecop);
-    fixReferences(&ast->right, incdecop);
+    fixReferences(&ast->left, incdecop, memtype);
+    fixReferences(&ast->right, incdecop, memtype);
 }
 
 /*
@@ -324,6 +354,39 @@ static AST *ExpandLhsSingle(AST *item) {
     } else {
         return NewAST(AST_EXPRLIST, item, NULL);
     }
+}
+
+static bool
+NeedIncDecTransform(AST *expr, AST *typ)
+{
+    if (typ) {
+        if (IsFloatType(typ) || IsInt64Type(typ) || IsBoolType(typ))
+            return true;
+    }
+
+    /* transform for explicit casts */
+    if (expr && expr->kind == AST_CAST)
+        return true;
+    /* keep inc/dec for traditional output, or at least be more
+       conservative about transforms
+    */
+    if (TraditionalBytecodeOutput())
+        return false;
+    if (IsIdentifier(expr) || expr->kind == AST_HWREG)
+        return false;
+    return true;
+}
+
+static int
+IncDecSize(AST *typ)
+{
+    if (!typ || !IsPointerType(typ))
+        return 1;
+    if (curfunc && !IsSpinLang(curfunc->language)) {
+        /* pointers are handled in type analysis code */
+        return 1;
+    }
+    return TypeSize(BaseType(typ));
 }
 
 void
@@ -590,30 +653,35 @@ doSimplifyAssignments(AST **astptr, int insertCasts, int atTopLevel)
                ++i -> (i = i+1, i) */
             if (ast->left) {
                 /* i++ case */
+                /* for anything complicated (not just i++), do
+                   the transform, for safety
+                */
                 AST *typ = ExprType(ast->left);
-                if (typ) {
-                    if (IsFloatType(typ) || IsInt64Type(typ) || IsBoolType(typ)) {
-                        AstReportAs(ast, &saveinfo);
-                        AST *temp = AstTempLocalVariable("_temp_", typ);
-                        AST *save = AstAssign(temp, ast->left);
-                        AST *update = AstAssign(ast->left, AstOperator(newop, ast->left, AstInteger(1)));
+                bool needTransform = NeedIncDecTransform(ast->left, typ);
+                int size = IncDecSize(typ);
+                if (needTransform) {
+                    AstReportAs(ast, &saveinfo);
+                    AST *temp = AstTempLocalVariable("_temp_", typ);
+                    AST *save = AstAssign(temp, ast->left);
+                    AST *update = AstAssign(ast->left, AstOperator(newop, ast->left, AstInteger(size)));
 
-                        ast = *astptr = NewAST(AST_SEQUENCE,
-                                               NewAST(AST_SEQUENCE, save, update),
-                                               temp);
-                        AstReportDone(&saveinfo);
-                    }
+                    ast = *astptr = NewAST(AST_SEQUENCE,
+                                           NewAST(AST_SEQUENCE, save, update),
+                                           temp);
+                    AstReportDone(&saveinfo);
                 }
-            } else {
+            } else if (ast->right) {
                 AST *ident = ast->right;
                 AST *typ = ExprType(ident);
-                if (typ) {
-                    if (IsFloatType(typ) || IsInt64Type(typ) || IsBoolType(typ)) {
-                        ast->kind = AST_ASSIGN;
-                        ast->d.ival = K_ASSIGN;
-                        ast->left = ident;
-                        ast->right = AstOperator(newop, ident, AstInteger(1));
-                    }
+                bool needTransform = NeedIncDecTransform(ast->right, typ);
+                int size = IncDecSize(typ);
+                if (needTransform) {
+                    AstReportAs(ast, &saveinfo);
+                    ast->kind = AST_ASSIGN;
+                    ast->d.ival = K_ASSIGN;
+                    ast->left = ident;
+                    ast->right = AstOperator(newop, ident, AstInteger(size));
+                    AstReportDone(&saveinfo);
                 }
             }
         }
@@ -641,7 +709,7 @@ DoHLTransforms(Function *F)
         }
     }
     // fix up references
-    fixReferences(&F->body, 0);
+    fixReferences(&F->body, 0, NULL);
     // simplify assignments within the function
     int insertCasts = !IsSpinLang(F->language);
     doSimplifyAssignments(&F->body, insertCasts, 1);

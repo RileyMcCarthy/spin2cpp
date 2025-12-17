@@ -23,8 +23,9 @@
 
     extern int gl_errors;
 
-    extern AST *last_ast;
-    
+    extern AST *last_ast, *prev_last_ast;
+    extern bool Spin2NewKeyword(LexStream *L, const char *ident);
+
 AST *
 SpinRetType(AST *funcdef)
 {
@@ -223,6 +224,13 @@ MakeFunccall(AST *func, AST *params, AST *numresults)
         func = NewAST(AST_CAST, GenericFunctionPtr(numresults), func);
     }
     return NewAST(AST_FUNCCALL, func, params);
+}
+
+static AST *
+MakeFunccall1(AST *func, AST *arg1)
+{
+    AST *exprlist = NewAST(AST_EXPRLIST, arg1, NULL);
+    return MakeFunccall(func, exprlist, NULL);
 }
 
 // special handling for things like "abc" | x
@@ -625,6 +633,11 @@ SpinDeclareInterface(AST *ident, AST *defs)
 %token SP_LOG    "LN"
 %token SP_EXP    "EXP"
 %token SP_POW    "POW"
+
+%token SP_MOVBYTS "MOVBYTS"
+%token SP_ENDIANL "ENDIANL"
+%token SP_ENDIANW "ENDIANW"
+%token SP_DEBUG_END_SESSION "DEBUG_END_SESSION"
 
 %token SP_FADD   "+."
 %token SP_FSUB   "-."
@@ -1725,12 +1738,32 @@ vardecl:
     { $$ = $1; }
   | SP_BYTE identdecl
     { $$ = NewAST(AST_DECLARE_VAR, ast_type_byte, $2); }
+  | '^' SP_BYTE identdecl
+    {
+        AST *typ = NewAST(AST_REFTYPE, ast_type_byte, NULL);
+        $$ = NewAST(AST_DECLARE_VAR, typ, $3);
+    }
   | SP_WORD identdecl
     { $$ = NewAST(AST_DECLARE_VAR, ast_type_word, $2); }
+  | '^' SP_WORD identdecl
+    {
+        AST *typ = NewAST(AST_REFTYPE, ast_type_word, NULL);
+        $$ = NewAST(AST_DECLARE_VAR, typ, $3);
+    }
   | SP_LONG identdecl
     { $$ = NewAST(AST_DECLARE_VAR, NULL, $2); }
+  | '^' SP_LONG identdecl
+    {
+        AST *typ = NewAST(AST_REFTYPE, ast_type_long, NULL);
+        $$ = NewAST(AST_DECLARE_VAR, typ, $3);
+    }
   | SP_QUAD identdecl
     { $$ = NewAST(AST_DECLARE_VAR, ast_type_long64, $2); }
+  | '^' SP_QUAD identdecl
+    {
+        AST *typ = NewAST(AST_REFTYPE, ast_type_long64, NULL);
+        $$ = NewAST(AST_DECLARE_VAR, typ, $3);
+    }
   | ptrstructname identdecl
     { $$ = NewAST(AST_DECLARE_VAR, $1, $2); }
 ;
@@ -2683,42 +2716,63 @@ funccall:
         AST *arg1 = $3;
         AST *ident = AstIdentifier("__builtin_log2f");
         
-        $$ = MakeFunccall(ident, arg1, NULL);
+        $$ = MakeFunccall1(ident, arg1);
     }
   | SP_EXP2 '(' expr ')'
     {
         AST *arg1 = $3;
         AST *ident = AstIdentifier("__builtin_exp2f");
         
-        $$ = MakeFunccall(ident, arg1, NULL);
+        $$ = MakeFunccall1(ident, arg1);
     }
   | SP_LOG10 '(' expr ')'
     {
         AST *arg1 = $3;
         AST *ident = AstIdentifier("__builtin_log10f");
         
-        $$ = MakeFunccall(ident, arg1, NULL);
+        $$ = MakeFunccall1(ident, arg1);
     }
   | SP_EXP10 '(' expr ')'
     {
         AST *arg1 = $3;
         AST *ident = AstIdentifier("__builtin_exp10f");
         
-        $$ = MakeFunccall(ident, arg1, NULL);
+        $$ = MakeFunccall1(ident, arg1);
     }
   | SP_LOG '(' expr ')'
     {
         AST *arg1 = $3;
         AST *ident = AstIdentifier("__builtin_logf");
         
-        $$ = MakeFunccall(ident, arg1, NULL);
+        $$ = MakeFunccall1(ident, arg1);
     }
   | SP_EXP '(' expr ')'
     {
         AST *arg1 = $3;
         AST *ident = AstIdentifier("__builtin_expf");
         
-        $$ = MakeFunccall(ident, arg1, NULL);
+        $$ = MakeFunccall1(ident, arg1);
+    }
+  | SP_ENDIANL '(' expr ')'
+    {
+        AST *arg1 = $3;
+        AST *ident = AstIdentifier("__builtin_bswap32");
+        
+        $$ = MakeFunccall1(ident, arg1);
+    }
+  | SP_ENDIANW '(' expr ')'
+    {
+        AST *arg1 = $3;
+        AST *ident = AstIdentifier("__builtin_bswap16");
+        
+        $$ = MakeFunccall1(ident, arg1);
+    }
+  | SP_MOVBYTS '(' operandlist ')'
+    {
+        AST *args = $3;
+        AST *ident = AstIdentifier("__builtin_movbyts");
+        
+        $$ = MakeFunccall(ident, args, NULL);
     }
 ;
 
@@ -2945,6 +2999,7 @@ spinyyerror(const char *msg)
 {
     extern int saved_spinyychar;
     int yychar = saved_spinyychar;
+    const char *new_keyword = NULL;
     
     SETCOLOR(PRINT_ERROR);
     ERRORHEADER(current->Lptr->fileName, current->Lptr->lineCounter, "error");
@@ -2959,6 +3014,9 @@ spinyyerror(const char *msg)
         if (!strncmp(msg, "unexpected identifier", strlen("unexpected identifier")) && last_ast && last_ast->kind == AST_IDENTIFIER) {
             fprintf(stderr, "unexpected identifier `%s'", last_ast->d.string);
             msg += strlen("unexpected identifier");
+            if (Spin2NewKeyword(current->Lptr, last_ast->d.string)) {
+                new_keyword = last_ast->d.string;
+            }
         }
         // if we get a stray character in source, sometimes bison tries to treat it as a token for
         // error purposes, resulting in $undefined as the token
@@ -2975,7 +3033,18 @@ spinyyerror(const char *msg)
             msg++;
         }
     }
-    fprintf(stderr, "\n");     
+    fprintf(stderr, "\n");
     gl_errors++;
     RESETCOLOR();
+    if (!new_keyword && prev_last_ast && prev_last_ast->kind == AST_IDENTIFIER) {
+        if (Spin2NewKeyword(current->Lptr, prev_last_ast->d.string)) {
+            new_keyword = prev_last_ast->d.string;
+        }
+    }
+    if (new_keyword) {
+        SETCOLOR(PRINT_WARNING);
+        ERRORHEADER(current->Lptr->fileName, current->Lptr->lineCounter, "note");
+        fprintf(stderr, "`%s' is a keyword in some Spin2 versions; did you forget a {Spin2_vXX} comment?\n", new_keyword);
+        RESETCOLOR();
+    }
 }
